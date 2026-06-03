@@ -1,0 +1,303 @@
+---
+title: "Cross-Sectional Equity Alpha: From Data Inspection to Backtest"
+author: "Ying Sun"
+date: today
+abstract: |
+  This project builds a tradable, dollar-neutral cross-sectional equity alpha from a panel of security
+  reference data, eleven signals (`d1` to `d11`) and six risk factors (`rf1` to
+  `rf6`) spanning 2010 to 2017. The study runs from: data inspection and cleaning,
+  point-in-time feature and target construction, model tuning and selection, and a walk-forward backtest. Every step is built to avoid
+  look-ahead bias. The final chosen model is an ensemble forecast traded as a risk-factor-neutral,
+  dollar-neutral portfolio. It delivers a net Sharpe ratio of 1.41 over the full window (2011 to 2017) at 3.4% annualized volatility.
+---
+
+# Introduction
+
+The goal is to turn the provided cross-sectional data into a tradable alpha and to
+evaluate it strictly point-in-time. For each security $i$ and trading day $t$ the model forecasts a forward return close-to-close from $t+1$ to $t+2$,
+rank securities cross-sectionally, and hold a dollar-neutral portfolio rebalanced under realistic trading costs. I measure performance by the net
+(after transaction cost) Sharpe ratio of the walk-forward portfolio.
+
+This project rigorously eliminates look-ahead bias. Every transformation or calulation on day
+$t$ uses information available at or before $t$ only. Cross-sectional normalization is
+computed within a single day, the target is a strictly forward return, and models are trained and validated
+on rolling windows. During evaluation, such as feature selection, hyper-parameter tuning, or normalization statistics, the out-of-sample consequence is reported.
+
+The features used in the model are built from `d1` to `d11` and the group_id of the security only. 
+The six risk factors, `rf1` to `rf6` were not as alpha but to remove factor
+exposure from the final book. The work is organized in three notebooks: data inspection (`data_inspection.ipynb`), modeling
+(`alpha_model.ipynb`), and portfolio construction (`portfolio_construction.ipynb`).
+
+# Data Inspection
+
+This section documents the data-quality inspection and the signal diagnostics that later feature engineering  depends on. 
+The major procedures and findings are documented below, please find more experimental results and detailed plots in `data_inspection.ipynb`.
+
+
+## Data quality and cleaning
+
+- **Trading universe.** Only about 45% of rows are eligible to trade (`in_trading_universe`
+  equal to `Y`: 4.00M of 8.8M), and the universe size changes slightly over time, including a visible
+  drop in 2011 to 2012. Since the number of dropped securities is still relatively small, I've decided to still include them in the training data panel.
+  The model is trained using only tradable securities, to keep the the model 
+  aligned with realizable positions and avoids learning from securities we could never take a position in.
+- **Return outliers.** The daily return `ret1d` is fat-tailed and some values might be contaminated: 
+  the maximum is 1099 (that is, 109,900%), which are
+  data errors rather than tradable moves, and 8,854 returns are missing. I therefore
+  winsorized `ret1d` cross-sectionally at 1 and 99 percentiles each day before building the target or any return-based
+  statistic.
+- **Forward-return target.** The target is the forward return
+  $\text{ret1d\_fwd}(i,t)=\text{ret1d}(i,t+2)$. Given that signals available after market close on $t$, and 
+  returns are calculated close to close from previous day, return on $t+2$ is the earliest we can fully capture.
+  Because a security can leave the universe and
+  re-enter months later, a naive two-day shift would pair a row before the gap with a return
+  after it and create a spurious forward return across the gap. I instead compute chunks of continuous trading days for each security_id, 
+  and shift only within each chunk (a gap of more than five trading days starts a new run), so
+  no return is ever paired across a gap.
+- **Duplicate keys.** Three signal files have duplicates with same  `(data_date, security_id)` pair. 
+`d3` and `d4` contain 127,266 duplicate key pairs that are exact copies (zero conflicts) and duplicates are simply dropped. 
+`d9` has about 8.0 million duplicate-key pairs, of which 4.3 million
+  conflict and are different in values, so I aggregate them it into two features, the
+  per-key mean (`d9_mean`) and spread (`d9_spread`).
+- **Redundant signal.** Based on correlation and distribution plots, `d11` is identified as exact`d10` timed by a uniformly random variable between 3 to 4. 
+ Therefore, `d10` and `d11` have rank correlation 1.0 and
+  near-identical IC, so I dropped `d11` to avoid double counting.
+- **Security groups.** Prices are strictly positive (one row has non-positive volume), and
+  the `group_id` hierarchy resolves to 11 top-level groups (25, 72, and 176 at finer levels)
+  with no outlier bucket, so I devided to use this top-level `group_id` as an input variable.
+- **Nonlinearity.** For each signal, I calcualte the per-quantile forward-return profiles, 
+several signals are curved and non-monotone rather than clear linear patterns, with most of the 
+returns concentrated in the extreme buckets and little in the middle, which indicates a nonlinear 
+signal-to-return relationship and therefore justifies evaluating nonlinear models that can capture such threshold and saturation effects.
+
+## Signal forecasting power
+
+As a proxy for singal forecasting power, I calculated the per-signal information coefficient, its annualized information
+ratio (IR), hit rate, and coverage. @tbl-ic and @fig-ic-strength summarize it.
+
+| Signal | Coverage | Missing | Mean IC | IC IR (ann.) | Hit rate |
+|:--|--:|--:|--:|--:|--:|
+| d3  | 1.5%  | 21.5% | $+0.041$ | $+3.69$ | 75.4% |
+| d1  | 1.5%  | 3.8%  | $+0.036$ | $+3.57$ | 75.1% |
+| d5  | 1.5%  | 11.8% | $+0.032$ | $+2.76$ | 77.5% |
+| d2  | 1.5%  | 11.5% | $+0.030$ | $+2.64$ | 80.3% |
+| d6  | 1.5%  | 19.6% | $-0.022$ | $-2.05$ | 78.0% |
+| d9  | 92.1% | 0%    | $-0.011$ | $-1.72$ | 61.5% |
+| d7  | 1.5%  | 19.0% | $-0.012$ | $-1.21$ | 77.6% |
+| d4  | 1.5%  | 3.7%  | $+0.013$ | $+1.08$ | 76.4% |
+| d10 | 56.2% | 0%    | $+0.004$ | $+0.69$ | 55.6% |
+| d11 | 56.2% | 0%    | $+0.004$ | $+0.68$ | 55.7% |
+| d8  | 97.6% | 0%    | $-0.001$ | $-0.13$ | 49.6% |
+
+: Per-signal coverage and forecasting power, ranked by absolute IC. {#tbl-ic}
+
+{{< embed ../data_inspection.ipynb#fig-ic-strength >}}
+
+Two findings drive the modeling. First, forecasting power is concentrated. A handful of
+signals carry almost all of it: `d3`, `d1`, `d5`, and `d2` (positive) and `d6`, `d7`, and
+`d9` (negative) have information ratios between roughly 1.7 and 3.7 with hit rates of 75% to
+80%, while `d8` is essentially noise (IC near zero) and `d10` and `d11` are weak and
+redundant. Second, the strongest signals are the sparsest: `d1` to `d7` cover only about 1.5%
+of tradable name-days, whereas the high-coverage signals `d8` and `d9` are weak. Thus, for the most sparse signals `d1`
+and `d2`, I decided to include two indicators for whether they are NaN as engineered features.
+ This trade-off explains why a sparse, robust, IC-weighted combination later outperforms a
+all-variable regression. A signal is useful only if its IC is persistent rather than
+concentrated in one period, so I also examine the rolling IC over time in @fig-ic-stability.
+
+{{< embed ../data_inspection.ipynb#fig-ic-stability >}}
+
+## Signal distributions and collinearity
+
+The raw signals are heavy-tailed and mixed-sign (@fig-signal-dist), which rules out normal scaling or
+min-max scaling and motivates the rank-based normalization used in modeling. The collinearity
+structure (@fig-collinearity) shows that several signals move together but that the
+information is not perfectly duplicated apart from the `d10` and `d11` pair noted above; a
+Pearson-versus-Spearman comparison further shows several pairs (`d1`&`d2`, `d2`&`d3`, and `d4`&`d5`)that look uncorrelated under
+raw Pearson yet are strongly monotone, since heavy tails break linear correlation, again
+favoring rank-based methods.
+
+{{< embed ../data_inspection.ipynb#fig-signal-dist >}}
+
+{{< embed ../data_inspection.ipynb#fig-collinearity >}}
+
+## Risk factors
+
+I characterized the six risk factors and confirmed that the signals are not disguised factor
+exposures: no signal is strongly correlated with any of `rf1` to `rf6`. The alpha is therefore
+largely orthogonal to the factor structure, which justifies using the risk-factor
+neutralization in portfolio construction to reduce volatility without weakening signals.
+
+# Modeling
+
+## Target and feature construction
+
+The prediction target is the winsorized forward return, demeaned cross-sectionally each day so
+that the model learns relative ranking rather than the market's daily level. For features we
+apply one consistent transform to every signal and risk factor: a cross-sectional rank
+followed by an inverse-normal mapping, computed within each day. I chose this rank-Gaussian
+transform over min-max or z-scoring for three reasons that the data inspection made clear. It
+is robust to the extreme tails and data errors in the raw signals, it handles the mixed-sign
+sparse signals and the positive heavy-tailed ones on the same footing, and because it is
+purely cross-sectional it cannot leak information across time. After this transform, filling a
+missing value with zero correctly means "the cross-sectional median" rather than an extreme
+value.
+
+## Objective: information coefficient, not mean squared error
+
+I select models on the information coefficient rather than on mean squared error or
+$R^2$. I initially tested models by mean squared error and $R^2$, but the fitted values were dominated 
+by noise: the cross-sectional $R^2$ sat near $10^{-4}$, the predictions were unstable from day to day, and the 
+metric barely separated good models from bad, which is what made me switch to the information coefficient.
+Daily returns are almost unpredictable in level, so squared-error metrics barely separate models and are not
+aligned with what a cross-sectional book actually monetizes, namely the correct rank ordering
+of names each day. The IC measures exactly that rank-ordering skill and is the same quantity
+the portfolio converts into return, so optimizing it keeps model selection and trading
+objective consistent.
+
+## Model comparison and choice
+
+I majorly compared four families on the same walk-forward protocol: forward-stepwise linear
+regression, principal-component regression, regularized linear models (ridge, lasso, and
+elastic net), and gradient-boosted trees (XGBoost and LightGBM). There are mainly two reasons behind this design. 
+First, with only about a dozen weak, mostly linear signals, the gradient-boosted
+trees did not beat a well-regularized linear model out of sample and tended to add turnover
+without adding return, so the extra complexity was not justified. Second, no single linear
+model dominated. I therefore use an **ensemble** of two complementary point-in-time models:
+
+1. an **IC-weighted composite**, which in each window weights each signal by its trailing
+   information coefficient and sums them, giving a robust, low-variance, low-turnover forecast;
+2. a **ridge regression** on the standardized signals together with the risk factors,
+   refit each month, which captures joint linear structure the composite ignores.
+
+The traded forecast is the average of the per-day cross-sectional z-scores of the two models.
+As Section 5 shows, this ensemble produces a higher net Sharpe than either component alone.
+
+## Walk-forward design & refit window
+
+I train on a rolling 12-month window and refit every month. One year of roughly 2,000 names per day gives ample
+data for stable coefficients while staying short enough to track regime drift, and monthly
+refitting keeps the model current. Shorter windows made the coefficients noisier and longer
+ones adapted too slowly, so I fixed 12 months with monthly refits in advance.
+
+I set weekly rebalancing in advance, and then confirmed it rather than
+tuned to it: as Section 4.4 shows, the net Sharpe is essentially flat across daily, weekly, and
+monthly rebalancing (1.35, 1.41, 1.29), so the choice is robust while trading far less than
+daily.
+
+I also shaped the feature set. I dropped the industry one-hot dummies, which encode static
+industry means that do not predict the demeaned forward return and caused ill-conditioning;
+industry and factor exposure are handled instead by neutralization. And I tested classic price
+and volume features (short-term reversal, momentum, realized volatility) but found that at this
+two-day horizon they hurt out-of-sample performance, adding turnover with no return, so I
+rejected them.
+
+# Portfolio Construction and Results
+
+## From alpha to a dollar-neutral book
+
+Each day we demean the smoothed forecast across the cross-section, so the book is dollar
+neutral by construction, then scale the positive side to sum to plus one and the negative side
+to minus one. Weights are proportional to forecast conviction. Because the alpha is spread
+over roughly 2,000 names, single-name weights are naturally tiny, so no explicit position cap
+is needed. The raw daily forecast is noisy, so trading it directly flips positions day to day
+and runs up turnover and noise-driven PnL swings. I therefore smooth each name's forecast over
+time with a causal (trailing-only) exponentially weighted moving average before forming
+weights, which makes positions persistent, strips noise, and sharply cuts turnover, raising the
+net Sharpe. I use a roughly one-month span (about 21 trading days) because it balances
+responsiveness against turnover: shorter spans barely cut turnover, longer ones lag the
+forecast and let it go stale. One month removes most of the turnover (roughly 0.48 to 0.07 on a
+representative book, with the Sharpe flat to slightly higher) while keeping the forecast fresh
+and matching the signals' multi-week persistence. I then build a risk-factor-neutral variant by
+regressing the forecast on the six risk factors each day and trading the residual.
+
+## Performance of the final model
+
+Cumulative return is the arithmetic running sum of daily returns, holding book size constant,
+as specified. @fig-performance shows the equity curve, the drawdown, the rolling one-year
+Sharpe ratio, and turnover for the final model. @tbl-perf lists the full statistics, net of 1
+basis point per side, with weekly rebalancing.
+
+{{< embed ../portfolio_construction.ipynb#fig-performance >}}
+
+| Statistic | Full OOS (2011-2017) | 2017 only |
+|:--|--:|--:|
+| Annualized return | 4.83% | 1.94% |
+| Annualized volatility | 3.42% | 2.88% |
+| Net Sharpe ratio | 1.41 | 0.67 |
+| Max drawdown (magnitude) | -4.40% | -2.30% |
+| Max drawdown length | 175 days | 38 days |
+| Positive days | 55.3% | 56.2% |
+| Average daily turnover | 0.073 | 0.076 |
+| Annual cost drag | 0.19% | 0.19% |
+
+: Final model performance (ensemble, risk-factor-neutral, weekly, net of 1 bp). {#tbl-perf}
+
+The book delivers a net Sharpe of 1.41 at only 3.4% volatility, with a shallow worst drawdown
+of 4.4% that recovers within about eight months, and it is profitable on 55% of days. The
+volatility is deliberately low because the largest single improvement is risk-factor
+neutralization: as @tbl-board shows, the same forecast traded without neutralization (the
+"base" variant) runs at 11.0% volatility with a Sharpe of only 0.36 and a 27.6% drawdown.
+Neutralizing the six factors cuts volatility from 11.0% to 3.4% and lifts the Sharpe from 0.36
+to 1.41, which confirms the data-inspection finding that most of the base book's risk is
+uncompensated factor exposure rather than alpha. The ensemble also beats each component: the
+IC-composite reaches 1.33 and the ridge model 1.26, so blending the two adds about 0.08 of
+Sharpe.
+
+| Book | IC | Net Sharpe | Ann. return | Ann. vol | Max DD | Turnover |
+|:--|--:|--:|--:|--:|--:|--:|
+| ensemble, rf-neutral | 0.0098 | **1.41** | 4.83% | 3.42% | -4.40% | 0.073 |
+| composite, rf-neutral | 0.0097 | 1.33 | 4.56% | 3.42% | -4.69% | 0.058 |
+| ridge, rf-neutral | 0.0081 | 1.26 | 4.53% | 3.59% | -4.15% | 0.127 |
+| composite, base | 0.0097 | 0.92 | 6.65% | 7.23% | -12.66% | 0.048 |
+| ensemble, base | 0.0098 | 0.36 | 3.96% | 11.00% | -27.61% | 0.053 |
+| ridge, base | 0.0081 | 0.04 | 0.56% | 14.07% | -40.59% | 0.059 |
+
+: Leaderboard of all books, ranked by net Sharpe (full OOS, weekly, net of 1 bp). {#tbl-board}
+
+## Impact of trading cost
+
+Cost scales only with turnover, so we sweep the assumed cost against the same gross series
+(@tbl-cost). The strategy has substantial cost headroom: each basis point of cost removes
+about 0.19% of annual return, the net Sharpe is still 1.20 at 5 bp and 0.92 at 10 bp, and the
+breakeven cost at which the net Sharpe reaches zero is roughly 26 bp per side. For a book that
+trades only about 7% of its notional per day, a realistic 1 to 2 bp assumption leaves the
+result essentially intact.
+
+| Cost (bps, one-way) | 0 | 1 | 2 | 3 | 5 | 7.5 | 10 |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| Net Sharpe | 1.47 | 1.41 | 1.36 | 1.30 | 1.20 | 1.06 | 0.92 |
+| Annual return | 5.02% | 4.83% | 4.65% | 4.46% | 4.09% | 3.63% | 3.16% |
+
+: Net Sharpe and annual return versus assumed trading cost. {#tbl-cost}
+
+## Impact of rebalance frequency
+
+We also vary how often the target weights are refreshed (@tbl-rebal). Weekly rebalancing is
+the sweet spot. Daily rebalancing chases noise and roughly doubles turnover (0.152 versus
+0.073) for a slightly lower Sharpe, while monthly rebalancing halves turnover again but lets
+the forecast go stale, lowering the Sharpe to 1.29. Weekly keeps almost all of the signal at a
+fraction of the trading.
+
+| Rebalance | Net Sharpe | Ann. return | Turnover | Annual cost |
+|:--|--:|--:|--:|--:|
+| Daily | 1.35 | 4.64% | 0.152 | 0.38% |
+| Weekly | 1.41 | 4.83% | 0.073 | 0.19% |
+| Monthly | 1.29 | 4.41% | 0.039 | 0.10% |
+
+: Net Sharpe and turnover by rebalance frequency. {#tbl-rebal}
+
+# Future Improvements and Concerns
+
+Here are some potential improvements and next steps:
+
+- **Recent-period strength.** The Sharpe over the full window is 1.41, but the 2017-only slice
+  is 0.67 on a single year of data. This is a thin estimate, yet it is a reminder to monitor
+  whether the edge is fading and to keep the walk-forward refit running.
+- **Signal opacity and concentration.** The strongest signals (`d1` to `d7`) are observed on
+  only about 1.5% of name-days. The forecast leans on sparse, proprietary inputs, which is a
+  concentration and data-availability risk.
+- **Cost realism and capacity.** We model cost as linear in turnover. A real book would face
+  market impact and borrow costs that grow with size, so the 3.4% volatility, while safe,
+  also limits standalone return; scaling up would require a capacity and impact study.
+- **Target Engineering** Currently a single 2-day-ahead return. We could try multi-horizon or denoised targets.
+- **Dynamic signal reweighting** The rolling-IC plot shows IC drifts over time. The IC-composite already uses a trailing-window IC. I'd wnat to extend this to decay-weighted or shrinkage IC estimates, or weights conditioned on a regime variable (cross-sectional dispersion, volatility), could adapt faster than a flat 12-month window.

@@ -1,0 +1,12 @@
+# Large / confidential data — never commit
+*.csv
+*.parquet
+*.zip
+outputs/
+
+# Build + OS cruft
+.quarto/
+report/.quarto/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store

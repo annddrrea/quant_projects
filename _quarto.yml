@@ -1,0 +1,13 @@
+project:
+  type: default
+  render:
+    - report/report.qmd
+
+format:
+  pdf:
+    documentclass: article
+    toc: true
+    number-sections: true
+    geometry: margin=1in
+    colorlinks: true
+    fig-pos: 'htbp'
